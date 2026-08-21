@@ -1,0 +1,21 @@
+# Changelog
+
+## 1.0.0 — 2026-08-21
+
+Initial release of **VoxelVR**, split out of Dramatic Shape Voxel Mod so the
+core voxel experience no longer loads LuaJIT FFI or the OpenXR loader.
+
+### Added
+- OpenXR / PCVR session (Windows) as a companion to `DRAMATIC_SHAPE`
+- Hybrid library bridge: local `VR*` / `Diorama` / `Pokedex` modules, with
+  fall-through to the main mod’s `exports.lib` for shared code
+- `ModSetting` copy so **VR** and **SMOOTH TURN** register on this mod’s
+  manager page and on the live OPTIONS menu
+- `mod.find("DRAMATIC_SHAPE")` wiring for `cycleVoxel` / `setVoxelLevel`
+- Exports (`active`, `mirror`, `invalidate`, `setPaletteFor`) for the main
+  mod’s soft mirror and invalidate hooks
+- Ships `assets/vr/openxr_loader.dll` (Khronos loader)
+
+### Notes
+- Depends on Dramatic Shape Voxel Mod **1.9.0+**
+- Platform: Windows x64 + OpenXR runtime only

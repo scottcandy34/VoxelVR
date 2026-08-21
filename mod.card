@@ -1,0 +1,22 @@
+return {
+  summary = "PCVR / OpenXR companion for Dramatic Shape Voxel Mod. Puts Kanto in a headset on Windows.",
+  added = {
+    "OpenXR session driven from the same voxel world Dramatic Shape draws on the desk",
+    "VR row (OFF / STANDARD / DIORAMA / DIORAMA-MR) and SMOOTH TURN on the OPTIONS menu",
+    "Per-eye render of the overworld, staged battles, and horde mode",
+    "Tracked controllers: move, A/B, START, stick-click steps the VOXEL ladder, grips for table / diorama",
+    "Floating panel or Pokedex in the left hand for the GB UI while a headset is live",
+    "Desk window as left-eye mirror when a session is running",
+  },
+  known = {
+    "Windows x64 only (ships openxr_loader.dll and Win32 GL interop via FFI)",
+    "Requires Dramatic Shape Voxel Mod (DRAMATIC_SHAPE) enabled",
+    "Needs an OpenXR runtime (SteamVR, Oculus, WMR, …)",
+    "Heavy with WATER FULL or AA up — one scene draw per eye",
+    "No controller button leaves VR; that is the VR options row's job",
+  },
+  credits = {
+    { who = "The Khronos Group", for_ = "OpenXR loader in assets/vr (Apache-2.0)" },
+    { who = "Dramatic Shape Voxel Mod", for_ = "the world this companion sits on" },
+  },
+}

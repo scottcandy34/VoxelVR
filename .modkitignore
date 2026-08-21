@@ -1,0 +1,14 @@
+# Files that stay in the repo and out of the distributed package.
+# Exact relative paths, one per line -- modkit matches literally, no globs.
+
+# The SDK suite and the probes it grew out of. A shipped test that requires
+# an engine module reads as a private require against the archive
+# (CONTRIBUTING-mods.md "What the PR must contain", 2).
+
+# Authoring tools. These run by hand on a machine that has imported its own
+# ROM, read the local cache, and emit assets/voxels/*.lua; the carved models
+# are what a player installs, the carving is not.
+
+# assets/docs/**.md stays in: data/voxel_heights.lua points a modder at the
+# building catalogue, and the methodology is where the geometry's provenance
+# is written down.
