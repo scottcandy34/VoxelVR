@@ -12,14 +12,20 @@ sandbox-safe everywhere.
 
 ## Requirements
 
-- **Dramatic Shape Voxel Mod** (`DRAMATIC_SHAPE`) **1.9.0+** installed and enabled
+- **Dramatic Shape Voxel Mod** (`DRAMATIC_SHAPE`) **1.9.3+** recommended
+  (1.9.0+ still loads; this mod then drives itself from `Game:update`)
 - Windows x64
-- An OpenXR runtime (SteamVR, Oculus App, Windows Mixed Reality, etc.)
+- An OpenXR runtime (SteamVR, Meta Horizon Link, Windows Mixed Reality, …)
 - A PCVR headset
+
+The mod sandbox does not allow `require("ffi")` on the game thread. 1.1.0
+runs the OpenXR session on a companion thread (manifest permission
+`compute`) and copies eye and panel pixels across. That readback is
+slower than a GPU blit. Update both mods together.
 
 ## Install
 
-1. Install / update Dramatic Shape Voxel Mod to **1.9.0** or newer.
+1. Install / update Dramatic Shape Voxel Mod to **1.9.3** or newer.
 2. Import this mod: **MODS → Import mod .zip**.
 3. Enable both mods.
 

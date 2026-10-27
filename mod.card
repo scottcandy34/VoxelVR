@@ -9,9 +9,10 @@ return {
     "Desk window as left-eye mirror when a session is running",
   },
   known = {
-    "Windows x64 only (ships openxr_loader.dll and Win32 GL interop via FFI)",
-    "Requires Dramatic Shape Voxel Mod (DRAMATIC_SHAPE) enabled",
-    "Needs an OpenXR runtime (SteamVR, Oculus, WMR, …)",
+    "Windows x64 only. OpenXR runs on a companion thread because the sandbox blocks FFI on the game thread",
+    "Needs the compute permission, Dramatic Shape 1.9.3+ (older main mods still work via a Game:update wrap), and an OpenXR runtime",
+    "Eye and panel pixels are read back each frame, so a busy scene will not hold full headset rate",
+    "A runtime can reject the worker's GL context; the VR row then shows that status",
     "Heavy with WATER FULL or AA up — one scene draw per eye",
     "No controller button leaves VR; that is the VR options row's job",
   },

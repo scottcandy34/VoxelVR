@@ -142,7 +142,15 @@ mod.events:on("mod.options_changed", function(payload)
 end)
 
 -- ------- per-frame VR drive
-do
+--
+-- Dramatic Shape 1.9.3+ calls exports.update from the voxel pipeline,
+-- which is the tick that already runs through menus and battles. Older
+-- main mods do not, so this wraps Game:update instead. Doing both would
+-- submit two OpenXR frames per tick.
+mod.exports.update = function(dt)
+  pcall(VR.update, dt)
+end
+if not mainInfo.exports.drivesVR then
   local ok, err = pcall(function()
     local Game = require("src.core.Game")
     if Game.dramaticShapeVRHook then return end
@@ -155,6 +163,8 @@ do
     V.dlog("Game:update wrap installed")
   end)
   if not ok then V.dlog("Game:update wrap failed: " .. tostring(err)) end
+else
+  V.dlog("main mod drives VR; Game:update left alone")
 end
 
 -- ------- publish exports for the main mod's soft hooks (mirror, active)
