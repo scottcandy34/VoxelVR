@@ -20,6 +20,12 @@
 --     battle or wipe is what the flat screen is showing
 --   xrEndFrame with the projection layer and/or the quad
 --
+-- The mod sandbox refuses FFI on the game thread, which is the only
+-- thread LOVE will draw on. When start() fails for that reason the same
+-- ceremony runs on a LOVE thread instead (lib/vr_worker.lua, the compute
+-- permission): eyes and the panel cross the channel as RGBA bytes and
+-- the worker uploads them. Hosts that still allow FFI keep the blit.
+--
 -- WHICH VR YOU GET is the row's own rung first (see VR.setting), and only
 -- then the VOXEL ladder. STANDARD is the mode described below. The two
 -- DIORAMA rungs are one presentation instead of a ladder -- the world is
@@ -122,6 +128,12 @@ local fboCache = setmetatable({}, { __mode = "k" })   -- canvas -> GL FBO id
 local mirrorSrc = nil           -- last left-eye canvas, for the window
 local mirrorCanvas = nil
 local status = "off"
+-- The worker cannot see the window. captureScreenshot during draw fills
+-- this for the NEXT update: one frame late, same as reading GL_FRONT.
+local screenGrab = nil          -- { bytes, w, h } from the last present
+local capturing = false         -- ask the draw hook for one more grab
+local drawHooked = false
+local remoteFrameWarned = false
 
 -- the diorama's live adjustments: the right stick's zoom (a multiplier on
 -- the model's size) and the grab-drag's height (metres of world travel)
@@ -255,6 +267,9 @@ local function shutdown(reason)
   zoom, heightOff = 1, 0
   fpYawOff, snapArmed = 0, true
   camMode, fadeAlpha = "explore", 0
+  capturing = false
+  screenGrab = nil
+  remoteFrameWarned = false
   -- the model goes back on the table where it started: the grab, the turn,
   -- the viewport's size and the meshes cut for it
   Diorama.reset()
@@ -296,12 +311,32 @@ local function dexScreen()
       dexCanvas = love.graphics.newCanvas(ww, wh)
       pcall(dexCanvas.setFilter, dexCanvas, "nearest", "nearest")
     end
-    local fbo = fboCache[dexCanvas]
-    if not fbo then
-      fbo = VRGL.canvasFBO(dexCanvas)
-      fboCache[dexCanvas] = fbo
+    if VRXR.remote() then
+      -- ImageData is already top-down, which is how the device's quad
+      -- samples the canvas. The old path flipped a GL front buffer to
+      -- get the same orientation; there is no front buffer to read here.
+      local grab = screenGrab
+      if not (grab and type(grab.bytes) == "string"
+              and grab.w == ww and grab.h == wh) then
+        return nil
+      end
+      local data = love.image.newImageData(ww, wh, "rgba8", grab.bytes)
+      local image = love.graphics.newImage(data)
+      love.graphics.setCanvas(dexCanvas)
+      love.graphics.clear(0, 0, 0, 1)
+      love.graphics.setColor(1, 1, 1, 1)
+      love.graphics.draw(image, 0, 0)
+      love.graphics.setCanvas()
+      if image.release then image:release() end
+      if data.release then data:release() end
+    else
+      local fbo = fboCache[dexCanvas]
+      if not fbo then
+        fbo = VRGL.canvasFBO(dexCanvas)
+        fboCache[dexCanvas] = fbo
+      end
+      if not (fbo and VRGL.copyFrontToCanvas(fbo, ww, wh)) then return nil end
     end
-    if not (fbo and VRGL.copyFrontToCanvas(fbo, ww, wh)) then return nil end
     local BattleScene = V.require("BattleScene")
     local lx, ly, s = BattleScene.letterbox()
     return { dexCanvas,
@@ -524,23 +559,40 @@ local function renderWorld(views, ctl)
     end)
   end
 
+  local stagedEyes = 0
   for i = 1, 2 do
     local canvas = canvases[i]
-    local tex, tw, th = VRXR.acquireEye(i)
-    if tex then
-      local fbo = fboCache[canvas]
-      if not fbo then
-        fbo = VRGL.canvasFBO(canvas)
-        fboCache[canvas] = fbo
+    if VRXR.remote() then
+      -- newImageData is top-down RGBA. The worker stores row 0 at GL
+      -- y = 0, which is where the old canvas blit put the visual top.
+      local okI, img = pcall(function() return canvas:newImageData() end)
+      if okI and img then
+        local w, h = img:getWidth(), img:getHeight()
+        local okB, bytes = pcall(function() return img:getString() end)
+        if img.release then pcall(function() img:release() end) end
+        if okB and type(bytes) == "string" then
+          VRXR.stageEye(i, bytes, w, h)
+          stagedEyes = stagedEyes + 1
+        end
       end
-      if fbo then
-        VRGL.blitToTexture(fbo, canvas:getWidth(), canvas:getHeight(),
-                           tex, tw, th)
+    else
+      local tex, tw, th = VRXR.acquireEye(i)
+      if tex then
+        local fbo = fboCache[canvas]
+        if not fbo then
+          fbo = VRGL.canvasFBO(canvas)
+          fboCache[canvas] = fbo
+        end
+        if fbo then
+          VRGL.blitToTexture(fbo, canvas:getWidth(), canvas:getHeight(),
+                             tex, tw, th)
+        end
       end
+      VRXR.releaseEye(i)
     end
-    VRXR.releaseEye(i)
   end
   mirrorSrc = canvases[1]
+  if VRXR.remote() then return stagedEyes == 2 end
   return true
 end
 
@@ -554,6 +606,53 @@ local function wantQuad(worldUp)
   return uiShowing()
 end
 
+-- The panel, from a screenshot rather than the front buffer. Letterbox
+-- coordinates stay in LOVE space (origin top-left): that is row 0 of
+-- the ImageData. The crop the headset sees is the fitted rect at the
+-- texture origin, same as the GL blit used to land it.
+local function updateQuadRemote(fp)
+  local grab = screenGrab
+  if not (grab and type(grab.bytes) == "string") then return nil end
+  local qw, qh = VRXR.quadSize()
+  if not (qw and qh and qw > 0 and qh > 0) then return nil end
+  local sw, sh = grab.w or 0, grab.h or 0
+  if sw < 1 or sh < 1 then return nil end
+  local crop = nil
+  local staged = false
+  pcall(function()
+    local BattleScene = V.require("BattleScene")
+    local lx, ly, s = BattleScene.letterbox()
+    local wpx = math.ceil(BattleScene.GB_W * s)
+    local hpx = math.ceil(BattleScene.GB_H * s)
+    local sx = math.max(0, math.floor(lx))
+    local sy = math.max(0, math.floor(ly))
+    wpx = math.min(wpx, sw - sx)
+    hpx = math.min(hpx, sh - sy)
+    if wpx < 1 or hpx < 1 then return end
+    local fit = math.min(qw / wpx, qh / hpx)
+    local dw = math.max(1, math.floor(wpx * fit))
+    local dh = math.max(1, math.floor(hpx * fit))
+    VRXR.stageQuad({
+      bytes = grab.bytes, sw = sw, sh = sh,
+      sx = sx, sy = sy, rw = wpx, rh = hpx, dw = dw, dh = dh,
+    })
+    staged = true
+    crop = { 0, 0, dw, dh }
+  end)
+  if not staged then
+    local dw = math.max(1, math.min(qw, sw))
+    local dh = math.max(1, math.min(qh, sh))
+    VRXR.stageQuad({
+      bytes = grab.bytes, sw = sw, sh = sh,
+      sx = 0, sy = 0, rw = math.min(dw, sw), rh = math.min(dh, sh),
+      dw = dw, dh = dh,
+    })
+  end
+  local base = fp and QUAD_FP or QUAD_DIORAMA
+  if not crop then return base end
+  return { pos = base.pos, width = base.width, crop = crop }
+end
+
 local function updateQuad(worldUp, fp)
   if not wantQuad(worldUp) then return nil end
   -- Wherever the pokedex is up and lit -- first person's menus, the
@@ -561,6 +660,7 @@ local function updateQuad(worldUp, fp)
   -- billboard is submitted at all. (No tracked left hand still gets
   -- the panel: the UI must be readable somewhere.)
   if Pokedex.frame and Pokedex.frame.tex then return nil end
+  if VRXR.remote() then return updateQuadRemote(fp) end
   local tex, qw, qh = VRXR.acquireQuad()
   if not tex then return nil end
   local ww, wh = qw, qh
@@ -848,6 +948,96 @@ end
 
 -- ------- the per-frame drive
 
+-- One screenshot per present, taken after the engine's own draw so the
+-- grab is the picture the desk window just showed. LOVE delivers the
+-- ImageData inside present(), which is before the next update.
+local function armCapture()
+  if drawHooked then
+    capturing = true
+    return
+  end
+  local ok = pcall(function()
+    if not (love.graphics and love.graphics.captureScreenshot and love.draw) then
+      error("screenshot capture is not available", 0)
+    end
+    local prev = love.draw
+    love.draw = function(...)
+      if prev then prev(...) end
+      if not capturing then return end
+      capturing = false
+      love.graphics.captureScreenshot(function(img)
+        if not img then return end
+        local w = img.getWidth and img:getWidth() or 0
+        local h = img.getHeight and img:getHeight() or 0
+        local okB, bytes = pcall(function() return img:getString() end)
+        if img.release then pcall(function() img:release() end) end
+        if okB and type(bytes) == "string" and w > 0 and h > 0 then
+          screenGrab = { bytes = bytes, w = w, h = h }
+        end
+      end)
+    end
+  end)
+  if not ok then return end
+  drawHooked = true
+  capturing = true
+end
+
+local function sessionPreamble(dt, mode)
+  if savedVsync == nil then
+    savedVsync = 1
+    pcall(function() savedVsync = love.window.getVSync() end)
+    pcall(love.window.setVSync, 0)
+  end
+  if Diorama.begin(mode) then dioramaRung() end
+  BattleCam.still = true
+  local want = battleStage() and "battle" or "explore"
+  if want ~= camMode then
+    fadeAlpha = math.min(1, fadeAlpha + (dt or 0) / FADE_TIME)
+    if fadeAlpha >= 1 then camMode = want end
+  else
+    fadeAlpha = math.max(0, fadeAlpha - (dt or 0) / FADE_TIME)
+  end
+end
+
+-- The worker already waited the frame. Render here, then always submit
+-- when that wait returned a time: xrBeginFrame has to be paired with
+-- xrEndFrame even if an eye failed to read back.
+local function driveRemote(dt, mode)
+  armCapture()
+  local frame = VRXR.remoteBegin()
+  if not frame then
+    local why = tostring(VRXR.status() or "session lost")
+    shutdown("session lost")
+    if not why:find("toggle", 1, true) then
+      why = why .. " -- toggle VR off and on to retry"
+    end
+    failed = why
+    return
+  end
+  if not frame.running then return end
+  sessionPreamble(dt, mode)
+  if not frame.haveTime then return end
+
+  local worldUp = false
+  local quadPose = nil
+  local dio = VR.dioramaMode()
+  local fp = (not dio) and FirstPerson.engaged()
+  local okF, errF = pcall(function()
+    driveControls(frame.input, dt, fp, dio)
+    if frame.should and frame.views then
+      worldUp = renderWorld(frame.views, frame.input) and true or false
+    end
+    quadPose = updateQuad(worldUp, fp)
+  end)
+  VRXR.remoteSubmit(worldUp and true or false, quadPose)
+  if not okF and not remoteFrameWarned then
+    remoteFrameWarned = true
+    local msg = "VR frame failed: " .. tostring(errF)
+    if V and V.dlog then V.dlog(msg)
+    else print("[VoxelVR] " .. msg) end
+  end
+end
+
 function VR.update(dt)
   local mode = VR.mode()
   local on = mode ~= "off"
@@ -885,6 +1075,11 @@ function VR.update(dt)
     end
   end
 
+  if VRXR.remote() then
+    driveRemote(dt, mode)
+    return
+  end
+
   if not VRXR.poll() then
     -- the runtime took the session away (headset off, runtime shut down)
     shutdown("session lost")
@@ -894,34 +1089,7 @@ function VR.update(dt)
   if not VRXR.isRunning() then return end
 
   -- the headset paces the app now; vsync would fight it
-  if savedVsync == nil then
-    savedVsync = 1
-    pcall(function() savedVsync = love.window.getVSync() end)
-    pcall(love.window.setVSync, 0)
-  end
-
-  -- Which VR this frame is, before anything reads it: the diorama's own
-  -- fields (the viewport, the chroma key) are open for the length of the
-  -- frame and shut with the session. The rung guard rides it -- there is
-  -- no 2D diorama and no first-person one.
-  if Diorama.begin(mode) then dioramaRung() end
-
-  -- the battle camera holds still for as long as a headset is watching:
-  -- its drift is a flat screen's depth cue, and a swaying picture inside
-  -- VR reads as the world lurching
-  BattleCam.still = true
-
-  -- The battle snap's fade: while the camera the frame WANTS is not the
-  -- one it is showing, black rises; at full black the mount swaps; then
-  -- black lifts. Driven here, on game time, so a fight that ends during
-  -- the fade just turns it around.
-  local want = battleStage() and "battle" or "explore"
-  if want ~= camMode then
-    fadeAlpha = math.min(1, fadeAlpha + (dt or 0) / FADE_TIME)
-    if fadeAlpha >= 1 then camMode = want end
-  else
-    fadeAlpha = math.max(0, fadeAlpha - (dt or 0) / FADE_TIME)
-  end
+  sessionPreamble(dt, mode)
 
   local time, should = VRXR.waitFrame()
   if not time then return end
@@ -981,6 +1149,7 @@ function VR.invalidate()
     pcall(mirrorCanvas.release, mirrorCanvas)
   end
   mirrorCanvas, mirrorSrc = nil, nil
+  screenGrab = nil
   if dexCanvas and dexCanvas.release then pcall(dexCanvas.release, dexCanvas) end
   dexCanvas = nil
   Pokedex.invalidate()

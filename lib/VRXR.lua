@@ -45,6 +45,12 @@ local eyes = {}                 -- per eye: { swapchain, images={texids}, w, h }
 local quad = nil                -- { swapchain, images, w, h }
 local sessionState = 0
 local running = false           -- xrBeginSession happened
+local remoteLive = false        -- session lives on the worker thread
+local remoteRunning = false     -- worker has seen SESSION_STATE_READY
+local remoteDead = false        -- channel desynced or the worker died
+local remoteQW, remoteQH = 1024, 768
+local worker = nil
+local staged = nil              -- eye / quad bytes waiting for submit
 local viewsBuf = nil            -- XrView[2], refreshed per locate
 local lastViews = nil           -- lua copies of the located views
 
@@ -714,7 +720,7 @@ end
 
 -- Bring the whole stack up, or say exactly why not. Never throws; call
 -- again after fixing whatever status() names.
-function VRXR.start(quadW, quadH)
+local function startInProcess(quadW, quadH)
   if session then return true end
   local ok, err = pcall(function()
     if not VRGL.load() then error(VRGL.status(), 0) end
@@ -827,6 +833,20 @@ end
 
 -- Tear the whole stack down (setting toggled off, or a fatal state).
 function VRXR.stop()
+  remoteDead = false
+  if remoteLive then
+    remoteLive, remoteRunning = false, false
+    pcall(function()
+      local chin = love.thread.getChannel("voxelvr.in")
+      chin:push({ op = "stop" })
+      if worker and worker.wait then worker:wait() end
+      chin:clear()
+      love.thread.getChannel("voxelvr.out"):clear()
+    end)
+    worker = nil
+    staged = nil
+    return
+  end
   running = false
   if session then pcall(function() xr.xrDestroySession(session) end) end
   if instance then pcall(function() xr.xrDestroyInstance(instance) end) end
@@ -878,6 +898,7 @@ function VRXR.poll()
 end
 
 function VRXR.isRunning()
+  if remoteLive then return remoteRunning end
   return running
 end
 
@@ -1063,11 +1084,184 @@ end
 
 function VRXR.quadSize()
   if quad then return quad.w, quad.h end
+  if remoteLive then return remoteQW, remoteQH end
   return nil
 end
 
 function VRXR.status()
   return status
+end
+
+-- The mod sandbox refuses require("ffi") on the game thread. The compute
+-- permission still allows a LOVE thread, and that thread is a full Lua
+-- state, so OpenXR runs there on its own GL context. Pixel bytes cross
+-- the channel; cdata never does.
+local CH_IN, CH_OUT = "voxelvr.in", "voxelvr.out"
+
+local function ffiBlocked(err)
+  err = tostring(err or "")
+  return err:find("ffi", 1, true) ~= nil
+      or err:find("arbitrary C", 1, true) ~= nil
+end
+
+local function gameThread()
+  return love and love.graphics and love.graphics.newCanvas
+      and love.thread and love.thread.newThread
+end
+
+function VRXR.remote()
+  return remoteLive
+end
+
+function VRXR.stageEye(i, bytes, w, h)
+  if type(bytes) ~= "string" then return end
+  staged = staged or { eyes = {} }
+  staged.eyes = staged.eyes or {}
+  staged.eyes[i] = { bytes = bytes, w = w, h = h }
+end
+
+function VRXR.stageQuad(q)
+  if type(q) ~= "table" or type(q.bytes) ~= "string" then return end
+  staged = staged or { eyes = {} }
+  staged.quad = q
+end
+
+local function rpc(msg, timeout)
+  local okPush, pushErr = pcall(function()
+    love.thread.getChannel(CH_IN):push(msg)
+  end)
+  if not okPush then return nil, pushErr end
+  local reply = love.thread.getChannel(CH_OUT):demand(timeout or 5)
+  if reply == nil then
+    local err = worker and worker.getError and worker:getError()
+    return nil, err or "VR worker timed out"
+  end
+  if reply.ok == false then return nil, reply.err or "VR worker failed" end
+  return reply
+end
+
+local function startRemote(quadW, quadH)
+  remoteQW = tonumber(quadW) or 1024
+  remoteQH = tonumber(quadH) or 768
+  -- A source string (it contains newlines) is compiled by newThread
+  -- itself, so a zipped mod does not have to be a loose file the
+  -- thread loader can open by path. The filename remains the fallback.
+  local code = (V.path or "") .. "/lib/vr_worker.lua"
+  if V.mod and V.mod.read then
+    local okR, src = pcall(function() return V.mod:read("lib/vr_worker.lua") end)
+    if okR and type(src) == "string" and src:find("\n", 1, true) then
+      code = src
+    end
+  end
+  local okT, threadOrErr = pcall(function()
+    return love.thread.newThread(code)
+  end)
+  if not okT or not threadOrErr then
+    status = "VR worker failed to start: " .. tostring(threadOrErr)
+    return false
+  end
+  worker = threadOrErr
+  local okS, errS = pcall(function()
+    worker:start(V.path, remoteQW, remoteQH)
+  end)
+  if not okS then
+    status = "VR worker failed to start: " .. tostring(errS)
+    worker = nil
+    return false
+  end
+  -- The worker pushes one ready/fail message as soon as the session
+  -- exists (or doesn't). Do not push a command first or it sits in the
+  -- inbox ahead of the first frame.
+  local reply = love.thread.getChannel(CH_OUT):demand(8)
+  if reply == nil then
+    local err = worker.getError and worker:getError()
+    status = "VR worker: " .. tostring(err or "timed out starting")
+    pcall(function() worker:wait() end)
+    worker = nil
+    return false
+  end
+  if reply.ok == false then
+    status = "VR worker: " .. tostring(reply.err or "failed")
+    pcall(function() worker:wait() end)
+    worker = nil
+    return false
+  end
+  remoteLive = true
+  remoteRunning = false
+  remoteDead = false
+  status = reply.status or "session created"
+  return true
+end
+
+function VRXR.remoteBegin()
+  if not remoteLive or remoteDead then return nil end
+  staged = { eyes = {} }
+  local reply, err = rpc({ op = "begin" }, 5)
+  if not reply then
+    status = "VR worker: " .. tostring(err)
+    remoteRunning = false
+    remoteDead = true
+    return nil
+  end
+  -- A leftover submit ack has neither flag. The channel is no longer
+  -- paired with this call; drop the session rather than interpret it.
+  if reply.alive == nil then
+    status = "VR worker: protocol desync"
+    remoteRunning = false
+    remoteDead = true
+    return nil
+  end
+  if reply.alive == false then
+    status = reply.status or "session lost"
+    remoteRunning = false
+    return nil
+  end
+  remoteRunning = reply.running and true or false
+  if reply.status then status = reply.status end
+  if not remoteRunning then return { running = false } end
+  return {
+    running = true,
+    should = reply.should and true or false,
+    views = reply.views,
+    input = reply.input,
+    haveTime = reply.haveTime and true or false,
+  }
+end
+
+function VRXR.remoteSubmit(world, quadPose)
+  if not remoteLive or remoteDead then return end
+  local eyes = staged and staged.eyes or {}
+  local e1, e2 = eyes[1], eyes[2]
+  local both = e1 and e1.bytes and e2 and e2.bytes
+  local msg = { op = "submit", world = (world and both) and true or false }
+  if both and msg.world then
+    msg.eye1, msg.eye2 = e1, e2
+  end
+  if quadPose then msg.quadPose = quadPose end
+  if staged and staged.quad then msg.quad = staged.quad end
+  staged = { eyes = {} }
+  local reply, err = rpc(msg, 8)
+  if not reply then
+    status = "VR submit: " .. tostring(err)
+    remoteDead = true
+    remoteRunning = false
+  end
+end
+
+function VRXR.start(quadW, quadH)
+  if remoteLive or session then return true end
+  local ok = startInProcess(quadW, quadH)
+  if ok then return true end
+  -- A real OpenXR error (no runtime, no headset) is already the answer.
+  -- Only the sandbox's FFI refusal is worth retrying on the worker.
+  if not ffiBlocked(status) then return false end
+  if not gameThread() then return false end
+  local blocked = status
+  local started = startRemote(quadW, quadH)
+  if not started and status and blocked then
+    status = status .. " (game thread: " .. blocked .. ")"
+  end
+  return started
 end
 
 return VRXR

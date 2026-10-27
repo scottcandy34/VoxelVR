@@ -1,7 +1,7 @@
 {
   "id": "VOXEL_VR",
   "name": "VoxelVR",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "api": 2,
   "entry": "main.lua",
   "profile": "content",
@@ -10,7 +10,7 @@
   "priority": 110,
   "dependencies": ["DRAMATIC_SHAPE"],
   "optional_dependencies": [],
-  "permissions": ["engine_internals"],
+  "permissions": ["engine_internals", "compute"],
   "affects_link": false,
   "description": "PCVR (OpenXR) companion for Dramatic Shape Voxel Mod. Windows only. Requires DRAMATIC_SHAPE.",
   "github": "scottcandy34/VoxelVR"
